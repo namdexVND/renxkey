@@ -109,9 +109,9 @@ export default async function handler(req, res) {
       return res.status(502).json({ ok: false, error: "Không ghi được key lên Firebase" });
     }
 
-    // 3. Tạo link đích và rút gọn qua Link4M ở phía server
+    // 3. Tạo link đích ?ma=... và rút gọn qua Link4M ở phía server
     const joiner = CLAIM_PAGE_URL.includes("?") ? "&" : "?";
-    const targetUrl = `${CLAIM_PAGE_URL}${joiner}key=${encodeURIComponent(key)}`;
+    const targetUrl = `${CLAIM_PAGE_URL}${joiner}ma=${encodeURIComponent(key)}`;
     const linkInfo = await shortenWithLink4M(targetUrl);
 
     return res.status(200).json({
@@ -127,4 +127,4 @@ export default async function handler(req, res) {
   } catch (err) {
     return res.status(500).json({ ok: false, error: "Lỗi máy chủ khi tạo key và link 4M" });
   }
-    }
+}
