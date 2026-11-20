@@ -1,0 +1,1290 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RENX — Key Manager</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getDatabase, ref, set, get, remove, update, onValue, push } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+  import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyBnMlJe0q39CNZvttpNpLVnTlMXC6Z1ss8",
+    authDomain: "renxkey-38ec3.firebaseapp.com",
+    databaseURL: "https://renxkey-38ec3-default-rtdb.asia-southeast1.firebasedatabase.app",
+    projectId: "renxkey-38ec3",
+    storageBucket: "renxkey-38ec3.firebasestorage.app",
+    messagingSenderId: "367677449175",
+    appId: "1:367677449175:web:73931b7237fdd65c71e192",
+    measurementId: "G-H54RJWVB12"
+  };
+
+  const app = initializeApp(firebaseConfig);
+  const db = getDatabase(app);
+  const auth = getAuth(app);
+
+  let allKeys = {};
+  let currentFilter = 'all';
+  let selectedKeys = new Set();
+  let generatedList = [];
+
+  // ========== AUTH ==========
+  onAuthStateChanged(auth, user => {
+    if (user) {
+      document.getElementById('login-screen').style.display = 'none';
+      document.getElementById('app-screen').style.display = 'flex';
+      document.getElementById('admin-email').textContent = user.email;
+      loadKeys();
+    } else {
+      document.getElementById('login-screen').style.display = 'flex';
+      document.getElementById('app-screen').style.display = 'none';
+    }
+  });
+
+  window.doLogin = async function() {
+    const email = document.getElementById('login-email').value.trim();
+    const pass = document.getElementById('login-pass').value;
+    const btn = document.getElementById('login-btn');
+    const err = document.getElementById('login-error');
+    if (!email || !pass) { showError('Vui lòng nhập đủ thông tin!'); return; }
+    btn.innerHTML = '<span class="spinner"></span> Đang đăng nhập...';
+    btn.disabled = true;
+    err.style.display = 'none';
+    try {
+      await signInWithEmailAndPassword(auth, email, pass);
+    } catch(e) {
+      showError('Email hoặc mật khẩu không đúng.');
+      btn.innerHTML = 'Đăng nhập';
+      btn.disabled = false;
+    }
+  };
+
+  function showError(msg) {
+    const err = document.getElementById('login-error');
+    err.textContent = msg;
+    err.style.display = 'flex';
+    err.classList.add('shake');
+    setTimeout(() => err.classList.remove('shake'), 400);
+  }
+
+  window.doLogout = async function() {
+    await signOut(auth);
+    toast('Đã đăng xuất!', 'info');
+  };
+
+  // ========== LOAD KEYS ==========
+  function loadKeys() {
+    const keysRef = ref(db, 'keys');
+    onValue(keysRef, async snap => {
+      allKeys = snap.val() || {};
+      // Tự động xóa key hết hạn khỏi Firebase
+      await autoCleanExpired();
+      updateStats();
+      renderKeyTable();
+      renderDashboard();
+    });
+  }
+
+  async function autoCleanExpired() {
+    const now = Math.floor(Date.now() / 1000);
+    let count = 0;
+    for (const [id, k] of Object.entries(allKeys)) {
+      if (k.type === 'vip') continue;
+      const ts = parseExpireTs(k);
+      if (ts > 0 && now > ts) {
+        await remove(ref(db, 'keys/' + id));
+        delete allKeys[id];
+        count++;
+      }
+    }
+    if (count > 0) {
+      await addLog(`Tự động xóa ${count} key hết hạn`, 'error');
+      toast(`Đã tự xóa ${count} key hết hạn!`, 'info');
+    }
+  }
+
+  function updateStats() {
+    const vals = Object.values(allKeys);
+    const total = vals.length;
+    const active = vals.filter(k => !isExpired(k) && k.type !== 'vip').length;
+    const expired = vals.filter(k => isExpired(k)).length;
+    const vip = vals.filter(k => k.type === 'vip').length;
+    animateCount('stat-total', total);
+    animateCount('stat-active', active);
+    animateCount('stat-expired', expired);
+    animateCount('stat-vip', vip);
+  }
+
+  function animateCount(id, target) {
+    const el = document.getElementById(id);
+    const start = parseInt(el.textContent) || 0;
+    const diff = target - start;
+    const steps = 20;
+    let step = 0;
+    const interval = setInterval(() => {
+      step++;
+      el.textContent = Math.round(start + diff * (step / steps));
+      if (step >= steps) clearInterval(interval);
+    }, 16);
+  }
+
+  function parseExpireTs(k) {
+    // Ưu tiên expireAt (Unix timestamp số)
+    const raw = k.expireAt != null ? k.expireAt : k.expire;
+    if (!raw) return 0;
+    const n = Number(raw);
+    if (!isNaN(n) && n > 1000000000) return n; // Unix timestamp (giây)
+    // Dạng "YYYY-MM-DD" cũ
+    const d = new Date(String(raw));
+    return isNaN(d.getTime()) ? 0 : Math.floor(d.getTime() / 1000);
+  }
+
+  function isExpired(k) {
+    if (k.type === 'vip') return false;
+    const ts = parseExpireTs(k);
+    return ts > 0 && Math.floor(Date.now() / 1000) > ts;
+  }
+
+  function formatExpire(k) {
+    const ts = parseExpireTs(k);
+    if (ts > 0) return new Date(ts * 1000).toLocaleString('vi-VN');
+    return '—';
+  }
+
+  function getStatus(k) {
+    if (k.type === 'vip') return 'vip';
+    if (isExpired(k)) return 'expired';
+    return 'active';
+  }
+
+  function renderDashboard() {
+    const tbody = document.getElementById('recent-table');
+    const recent = Object.entries(allKeys).slice(0, 8);
+    if (!recent.length) {
+      tbody.innerHTML = '<tr><td colspan="5" class="empty-cell"><div class="empty-state"><div class="empty-icon">🔑</div><div>Chưa có key nào</div></div></td></tr>';
+      return;
+    }
+    tbody.innerHTML = recent.map(([id, k]) => `
+      <tr>
+        <td><span class="key-cell">${k.key || id}</span></td>
+        <td class="mono muted">${k.userId || '—'}</td>
+        <td>${typeBadge(k.type || 'normal')}</td>
+        <td class="mono muted small">${formatExpire(k)}</td>
+        <td>${statusBadge(getStatus(k))}</td>
+      </tr>
+    `).join('');
+  }
+
+  function typeBadge(type) {
+    const map = { normal:'⏱ Normal', day:'📅 Daily', week:'📆 Weekly', month:'🗓 Monthly', vip:'👑 VIP' };
+    if (type === 'vip') return `<span class="badge badge-vip">${map[type]||type}</span>`;
+    return `<span class="type-label">${map[type]||type}</span>`;
+  }
+
+  function statusBadge(s) {
+    if (s === 'active') return `<span class="badge badge-active"><span class="dot"></span>Active</span>`;
+    if (s === 'expired') return `<span class="badge badge-expired"><span class="dot"></span>Hết hạn</span>`;
+    if (s === 'vip') return `<span class="badge badge-vip">👑 VIP</span>`;
+    return '';
+  }
+
+  window.renderKeyTable = function() {
+    const search = (document.getElementById('search-input')?.value || '').toLowerCase();
+    const tbody = document.getElementById('keys-table');
+    let entries = Object.entries(allKeys).filter(([id, k]) => {
+      const ms = k.key?.toLowerCase().includes(search) || (k.userId||'').includes(search);
+      const status = getStatus(k);
+      const mf = currentFilter === 'all' || status === currentFilter || (currentFilter === 'vip' && k.type === 'vip');
+      return ms && mf;
+    });
+    if (!entries.length) {
+      tbody.innerHTML = '<tr><td colspan="8" class="empty-cell"><div class="empty-state"><div class="empty-icon">🔍</div><div>Không tìm thấy key nào</div></div></td></tr>';
+      return;
+    }
+    tbody.innerHTML = entries.map(([id, k]) => {
+      const status = getStatus(k);
+      return `<tr>
+        <td><input type="checkbox" class="row-check" data-id="${id}" ${selectedKeys.has(id)?'checked':''} onchange="toggleSelect('${id}', this.checked)"></td>
+        <td><span class="key-cell">${k.key||id}</span> <button class="icon-btn" onclick="copyText('${k.key||id}')" title="Copy">⎘</button></td>
+        <td class="mono muted small">${k.userId||'—'}</td>
+        <td>${typeBadge(k.type||'normal')}</td>
+        <td class="muted small">${k.created||'—'}</td>
+        <td class="small" style="color:${status==='expired'?'var(--red)':'var(--muted)'}">${formatExpire(k)}</td>
+        <td>${statusBadge(status)}</td>
+        <td>
+          <button class="icon-btn edit-btn" onclick="openEditModal('${id}')" title="Sửa">✏️</button>
+          <button class="icon-btn del-btn" onclick="deleteKey('${id}')" title="Xóa">🗑</button>
+        </td>
+      </tr>`;
+    }).join('');
+  };
+
+  window.filterKeys = function(filter, el) {
+    currentFilter = filter;
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    el.classList.add('active');
+    renderKeyTable();
+  };
+
+  window.openAddModal = function() {
+    document.getElementById('modal-key').value = generateKeyString(''); // random
+    document.getElementById('modal-userid').value = '';
+    document.getElementById('modal-type').value = 'month';
+    document.getElementById('modal-expire').value = getExpireDateStr('month');
+    document.getElementById('modal-add').classList.add('show');
+  };
+
+  window.addKeyManual = async function() {
+    const key = document.getElementById('modal-key').value.trim();
+    const type = document.getElementById('modal-type').value;
+    const expireStr = document.getElementById('modal-expire').value;
+    if (!key) return toast('Vui lòng nhập key!', 'error');
+    const id = key.replace(/[^a-zA-Z0-9_]/g, '_');
+    // Convert date string sang Unix timestamp
+    const expireAt = expireStr ? Math.floor(new Date(expireStr + 'T23:59:59').getTime() / 1000) : getExpireDate(type);
+    await set(ref(db, 'keys/' + id), { key, userId: '', type, expireAt, created: new Date().toLocaleDateString('vi-VN') });
+    await addLog(`Thêm key thủ công: ${key}`, 'success');
+    closeModal('modal-add');
+    toast('Đã thêm key!', 'success');
+  };
+
+  window.openEditModal = function(id) {
+    const k = allKeys[id];
+    document.getElementById('edit-id').value = id;
+    document.getElementById('edit-key').value = k.key;
+    document.getElementById('edit-userid').value = k.userId || '';
+    document.getElementById('edit-type').value = k.type;
+    // Convert timestamp sang YYYY-MM-DD cho input[type=date]
+    const ts = parseExpireTs(k);
+    const dateStr = ts > 0 ? new Date(ts * 1000).toISOString().split('T')[0] : '';
+    document.getElementById('edit-expire').value = dateStr;
+    document.getElementById('modal-edit').classList.add('show');
+  };
+
+  window.saveEdit = async function() {
+    const id = document.getElementById('edit-id').value;
+    const userId = document.getElementById('edit-userid').value;
+    const type = document.getElementById('edit-type').value;
+    const expireStr = document.getElementById('edit-expire').value;
+    const expireAt = expireStr ? Math.floor(new Date(expireStr + 'T23:59:59').getTime() / 1000) : getExpireDate(type);
+    await update(ref(db, 'keys/' + id), { userId, type, expireAt });
+    await addLog(`Sửa key: ${allKeys[id]?.key}`, 'info');
+    closeModal('modal-edit');
+    toast('Đã cập nhật key!', 'success');
+  };
+
+  window.deleteKey = async function(id) {
+    if (!confirm('Xóa key này?')) return;
+    const keyVal = allKeys[id]?.key;
+    await remove(ref(db, 'keys/' + id));
+    await addLog(`Xóa key: ${keyVal}`, 'error');
+    toast('Đã xóa key!', 'info');
+  };
+
+  window.bulkDelete = async function() {
+    if (!selectedKeys.size) return;
+    if (!confirm(`Xóa ${selectedKeys.size} key?`)) return;
+    for (const id of selectedKeys) await remove(ref(db, 'keys/' + id));
+    await addLog(`Xóa hàng loạt ${selectedKeys.size} key`, 'error');
+    selectedKeys.clear();
+    updateBulkBar();
+    toast(`Đã xóa!`, 'info');
+  };
+
+  window.generateKeys = async function() {
+    const type = document.getElementById('gen-type').value;
+    const suffix = document.getElementById('gen-suffix').value.trim();
+    const hasSuffix = suffix !== '';
+
+    // Nếu có tên cụ thể → chỉ tạo 1 key dù nhập số lượng > 1
+    const amount = hasSuffix ? 1 : Math.min(parseInt(document.getElementById('gen-amount').value)||1, 100);
+
+    let created = 0;
+    for (let i = 0; i < amount; i++) {
+      const key = generateKeyString(hasSuffix ? suffix : '');
+      const id = key.replace(/[^a-zA-Z0-9_]/g, '_');
+
+      // Kiểm tra key đã tồn tại chưa
+      const snap = await get(ref(db, 'keys/' + id));
+      if (snap.exists()) {
+        toast(`Key "${key}" đã tồn tại!`, 'error');
+        continue;
+      }
+
+      await set(ref(db, 'keys/' + id), { key, userId: '', type, expireAt: getExpireDate(type), created: new Date().toLocaleDateString('vi-VN') });
+      generatedList.unshift(key);
+      created++;
+    }
+
+    // Xóa ô tên sau khi tạo xong
+    document.getElementById('gen-suffix').value = '';
+
+    renderGeneratedList();
+    await addLog(`Tạo ${created} key loại ${type}${hasSuffix ? ' (tên: ' + suffix + ')' : ''}`, 'success');
+    toast(`Đã tạo ${created} key!`, 'success');
+  };
+
+  window.bulkGenerate = async function() {
+    const suffix = document.getElementById('bulk-suffix').value.trim();
+    const hasSuffix = suffix !== '';
+    const type = document.getElementById('bulk-type').value;
+
+    // Nếu có tên cụ thể → chỉ tạo 1 key
+    const amount = hasSuffix ? 1 : Math.min(parseInt(document.getElementById('bulk-amount').value)||10, 500);
+    if (amount < 1) return toast('Số lượng phải ít nhất 1!', 'error');
+
+    let created = 0;
+    for (let i = 0; i < amount; i++) {
+      const key = generateKeyString(hasSuffix ? suffix : '');
+      const id = key.replace(/[^a-zA-Z0-9_]/g, '_');
+
+      // Kiểm tra key đã tồn tại chưa
+      const snap = await get(ref(db, 'keys/' + id));
+      if (snap.exists()) {
+        toast(`Key "${key}" đã tồn tại!`, 'error');
+        continue;
+      }
+
+      await set(ref(db, 'keys/' + id), { key, userId: '', type, expireAt: getExpireDate(type), created: new Date().toLocaleDateString('vi-VN') });
+      generatedList.unshift(key);
+      created++;
+    }
+
+    document.getElementById('bulk-suffix').value = '';
+    renderGeneratedList();
+    await addLog(`Tạo hàng loạt ${created} key loại ${type}${hasSuffix ? ' (tên: ' + suffix + ')' : ''}`, 'success');
+    toast(`Đã tạo ${created} key!`, 'success');
+  };
+
+  function renderGeneratedList() {
+    const el = document.getElementById('generated-list');
+    if (!generatedList.length) { el.innerHTML = '<div class="empty-state"><div class="empty-icon">🔑</div><div>Chưa có key nào</div></div>'; return; }
+    el.innerHTML = generatedList.map(k => `
+      <div class="gen-item">
+        <span class="key-cell small">${k}</span>
+        <button class="icon-btn" onclick="copyText('${k}')">⎘</button>
+      </div>
+    `).join('');
+  }
+
+  window.copyAllGenerated = function() {
+    if (!generatedList.length) return toast('Chưa có key!', 'error');
+    copyText(generatedList.join('\n'));
+  };
+
+  window.clearGenerated = function() {
+    generatedList = [];
+    renderGeneratedList();
+  };
+
+  async function addLog(msg, type) {
+    await push(ref(db, 'logs'), { msg, type, time: new Date().toLocaleString('vi-VN') });
+  }
+
+  window.loadLogs = function() {
+    get(ref(db, 'logs')).then(snap => {
+      const data = snap.val() || {};
+      const entries = Object.values(data).reverse().slice(0, 100);
+      const el = document.getElementById('activity-log');
+      if (!entries.length) { el.innerHTML = '<div class="empty-state"><div class="empty-icon">📋</div><div>Chưa có hoạt động</div></div>'; return; }
+      el.innerHTML = entries.map(l => `
+        <div class="log-item">
+          <span class="log-dot" style="background:${l.type==='success'?'var(--green)':l.type==='error'?'var(--red)':'var(--blue)'}"></span>
+          <span>${l.msg}</span>
+          <span class="log-time">${l.time}</span>
+        </div>
+      `).join('');
+    });
+  };
+
+  window.clearLogs = async function() {
+    if (!confirm('Xóa toàn bộ log?')) return;
+    await remove(ref(db, 'logs'));
+    document.getElementById('activity-log').innerHTML = '<div class="empty-state"><div class="empty-icon">📋</div><div>Chưa có hoạt động</div></div>';
+    toast('Đã xóa log!', 'info');
+  };
+
+  window.exportKeys = function() {
+    const rows = ['Key,UserID,Type,Expire,Created,Status', ...Object.values(allKeys).map(k => `${k.key},${k.userId||''},${k.type},${k.expireAt||k.expire||''},${k.created||''},${getStatus(k)}`)];
+    const blob = new Blob([rows.join('\n')], { type: 'text/csv' });
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'renx_keys.csv'; a.click();
+    toast('Đã xuất CSV!', 'success');
+  };
+
+  function generateKeyString(suffix) {
+    if (suffix && suffix.trim() !== '') {
+      // Làm sạch suffix: chỉ giữ chữ, số, gạch dưới, viết hoa
+      const clean = suffix.trim().toUpperCase().replace(/[^A-Z0-9_]/g, '_');
+      return 'RENX_' + clean;
+    }
+    // Random nếu không có suffix
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    let r = 'RENX_';
+    for (let i = 0; i < 12; i++) r += chars[Math.floor(Math.random() * chars.length)];
+    return r;
+  }
+
+  function getExpireDate(type) {
+    const d = new Date();
+    if (type === 'normal') d.setHours(d.getHours() + 8);
+    else if (type === 'day') d.setDate(d.getDate() + 1);
+    else if (type === 'week') d.setDate(d.getDate() + 7);
+    else if (type === 'month') d.setDate(d.getDate() + 30);
+    else if (type === 'vip') d.setFullYear(d.getFullYear() + 100);
+    // Unix timestamp (giây) — thống nhất với script Roblox
+    return Math.floor(d.getTime() / 1000);
+  }
+
+  window.toggleSelect = function(id, checked) {
+    if (checked) selectedKeys.add(id); else selectedKeys.delete(id);
+    updateBulkBar();
+  };
+
+  window.toggleSelectAll = function() {
+    const checked = document.getElementById('select-all').checked;
+    document.querySelectorAll('.row-check').forEach(cb => {
+      cb.checked = checked;
+      if (checked) selectedKeys.add(cb.dataset.id); else selectedKeys.delete(cb.dataset.id);
+    });
+    updateBulkBar();
+  };
+
+  function updateBulkBar() {
+    document.getElementById('bulk-count').textContent = `${selectedKeys.size} key được chọn`;
+    document.getElementById('bulk-bar').classList.toggle('show', selectedKeys.size > 0);
+  }
+
+  window.clearSelection = function() {
+    selectedKeys.clear();
+    document.querySelectorAll('.row-check').forEach(cb => cb.checked = false);
+    if (document.getElementById('select-all')) document.getElementById('select-all').checked = false;
+    updateBulkBar();
+  };
+
+  window.closeModal = function(id) { document.getElementById(id).classList.remove('show'); };
+
+  window.copyText = function(text) {
+    navigator.clipboard.writeText(text).then(() => toast('Đã copy!', 'success'));
+  };
+
+  window.toast = function(msg, type = 'info') {
+    const el = document.createElement('div');
+    el.className = `toast toast-${type}`;
+    const icon = type==='success'?'✓':type==='error'?'✕':'ℹ';
+    el.innerHTML = `<span class="toast-icon">${icon}</span><span>${msg}</span>`;
+    document.getElementById('toast-container').appendChild(el);
+    setTimeout(() => { el.style.opacity='0'; el.style.transform='translateX(12px)'; }, 2500);
+    setTimeout(() => el.remove(), 2800);
+  };
+
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && document.getElementById('login-screen').style.display !== 'none') doLogin();
+    if (e.key === 'Escape') document.querySelectorAll('.modal-overlay.show').forEach(m => m.classList.remove('show'));
+  });
+</script>
+<style>
+:root {
+  --bg: #07070f;
+  --surface: #0d0d1a;
+  --surface2: #111125;
+  --border: #1c1c35;
+  --border2: #242445;
+  --accent: #7c3aed;
+  --accent2: #a78bfa;
+  --accent-dim: rgba(124,58,237,0.12);
+  --green: #10b981;
+  --red: #f43f5e;
+  --blue: #38bdf8;
+  --yellow: #fbbf24;
+  --text: #e2e8f0;
+  --text2: #94a3b8;
+  --muted: #475569;
+  --mono: 'JetBrains Mono', monospace;
+  --sans: 'Inter', sans-serif;
+  --radius: 12px;
+  --radius-sm: 8px;
+  --shadow: 0 4px 24px rgba(0,0,0,.5);
+}
+
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:var(--bg); color:var(--text); font-family:var(--sans); min-height:100vh; font-size:14px; line-height:1.5; }
+
+/* ── LOGIN ── */
+#login-screen {
+  display:none; align-items:center; justify-content:center;
+  min-height:100vh; position:relative; overflow:hidden;
+}
+
+#login-screen::before {
+  content:''; position:absolute; width:600px; height:600px;
+  background: radial-gradient(circle, rgba(124,58,237,0.18) 0%, transparent 70%);
+  top:-100px; left:50%; transform:translateX(-50%);
+  pointer-events:none;
+}
+
+.login-card {
+  background:var(--surface);
+  border:1px solid var(--border2);
+  border-radius:20px;
+  padding:44px 40px;
+  width:400px;
+  max-width:92vw;
+  box-shadow: 0 24px 64px rgba(0,0,0,.6), 0 0 0 1px rgba(167,139,250,0.06);
+  position:relative;
+  z-index:1;
+}
+
+.login-header { text-align:center; margin-bottom:36px; }
+.login-brand {
+  font-family:var(--mono);
+  font-size:28px;
+  font-weight:700;
+  letter-spacing:4px;
+  background: linear-gradient(135deg, #a78bfa, #c4b5fd);
+  -webkit-background-clip:text; -webkit-text-fill-color:transparent;
+}
+.login-sub {
+  font-size:11px; color:var(--muted); letter-spacing:3px;
+  text-transform:uppercase; margin-top:6px;
+}
+.login-divider {
+  width:32px; height:2px;
+  background:linear-gradient(90deg, var(--accent), var(--accent2));
+  margin:14px auto 0; border-radius:2px;
+}
+
+.login-error {
+  display:none; align-items:center; gap:8px;
+  background:rgba(244,63,94,0.08); border:1px solid rgba(244,63,94,0.25);
+  color:#fb7185; border-radius:var(--radius-sm);
+  padding:11px 14px; font-size:13px; margin-bottom:16px;
+}
+.login-error::before { content:'⚠'; }
+
+@keyframes shake {
+  0%,100% { transform:translateX(0); }
+  20%,60% { transform:translateX(-6px); }
+  40%,80% { transform:translateX(6px); }
+}
+.shake { animation:shake .35s ease; }
+
+.field { margin-bottom:18px; }
+.field-label {
+  display:block; font-size:11px; font-weight:500;
+  text-transform:uppercase; letter-spacing:1.2px;
+  color:var(--muted); margin-bottom:7px;
+}
+.field-input {
+  width:100%; background:var(--bg); border:1px solid var(--border2);
+  border-radius:var(--radius-sm); padding:12px 14px;
+  color:var(--text); font-family:var(--sans); font-size:14px;
+  outline:none; transition:border-color .15s, box-shadow .15s;
+}
+.field-input:focus {
+  border-color:var(--accent2);
+  box-shadow:0 0 0 3px rgba(167,139,250,0.1);
+}
+.field-input::placeholder { color:var(--muted); }
+
+/* reuse for app */
+.form-input { width:100%; background:var(--bg); border:1px solid var(--border2); border-radius:var(--radius-sm); padding:11px 14px; color:var(--text); font-family:var(--sans); font-size:14px; outline:none; transition:border-color .15s; }
+.form-input:focus { border-color:var(--accent2); }
+.form-input::placeholder { color:var(--muted); }
+.form-select { width:100%; background:var(--bg); border:1px solid var(--border2); border-radius:var(--radius-sm); padding:11px 14px; color:var(--text); font-family:var(--sans); font-size:14px; outline:none; }
+.form-group { margin-bottom:14px; }
+.form-label { display:block; font-size:11px; font-weight:500; text-transform:uppercase; letter-spacing:1px; color:var(--muted); margin-bottom:6px; }
+
+/* ── BUTTONS ── */
+.btn {
+  display:inline-flex; align-items:center; justify-content:center; gap:6px;
+  padding:10px 18px; border-radius:var(--radius-sm); border:none;
+  cursor:pointer; font-family:var(--sans); font-size:13px; font-weight:500;
+  transition:all .15s; text-decoration:none; white-space:nowrap;
+}
+.btn-primary {
+  background:linear-gradient(135deg, #6d28d9, #7c3aed);
+  color:white; width:100%; padding:13px; font-size:14px; font-weight:600;
+  box-shadow:0 4px 14px rgba(109,40,217,.35);
+}
+.btn-primary:hover { filter:brightness(1.1); transform:translateY(-1px); box-shadow:0 6px 20px rgba(109,40,217,.45); }
+.btn-primary:disabled { opacity:.55; transform:none; cursor:not-allowed; }
+.btn-outline { background:none; border:1px solid var(--border2); color:var(--text2); }
+.btn-outline:hover { border-color:var(--accent2); color:var(--accent2); }
+.btn-danger { background:rgba(244,63,94,.08); border:1px solid rgba(244,63,94,.25); color:#fb7185; }
+.btn-danger:hover { background:rgba(244,63,94,.14); }
+.btn-ghost { background:none; border:none; color:var(--text2); padding:7px 10px; }
+.btn-ghost:hover { color:var(--text); }
+
+.spinner {
+  width:14px; height:14px; border:2px solid rgba(255,255,255,.25);
+  border-top-color:white; border-radius:50%; display:inline-block;
+  animation:spin .6s linear infinite;
+}
+@keyframes spin { to { transform:rotate(360deg); } }
+
+/* ── APP ── */
+#app-screen { display:none; min-height:100vh; }
+
+/* ── SIDEBAR ── */
+.sidebar {
+  position:fixed; left:0; top:0; bottom:0; width:228px;
+  background:var(--surface); border-right:1px solid var(--border);
+  display:flex; flex-direction:column; z-index:100;
+}
+
+.sidebar-top {
+  padding:24px 20px 20px;
+  border-bottom:1px solid var(--border);
+}
+.logo-mark {
+  font-family:var(--mono); font-size:18px; font-weight:700;
+  letter-spacing:3px;
+  background:linear-gradient(135deg, var(--accent2), #c4b5fd);
+  -webkit-background-clip:text; -webkit-text-fill-color:transparent;
+}
+.logo-sub { font-size:10px; color:var(--muted); letter-spacing:2px; text-transform:uppercase; margin-top:3px; }
+
+nav { padding:12px 10px; flex:1; overflow-y:auto; }
+.nav-item {
+  display:flex; align-items:center; gap:10px;
+  padding:9px 12px; border-radius:var(--radius-sm);
+  cursor:pointer; font-size:13px; font-weight:400;
+  color:var(--text2); transition:all .12s; margin-bottom:2px;
+}
+.nav-item:hover { background:var(--accent-dim); color:var(--text); }
+.nav-item.active { background:var(--accent-dim); color:var(--accent2); font-weight:500; }
+.nav-icon { width:18px; text-align:center; font-size:15px; }
+
+.sidebar-footer {
+  padding:14px 16px; border-top:1px solid var(--border);
+}
+.admin-badge {
+  display:flex; align-items:center; gap:8px;
+  background:var(--surface2); border:1px solid var(--border);
+  border-radius:var(--radius-sm); padding:9px 12px; margin-bottom:8px;
+}
+.admin-dot { width:7px; height:7px; background:var(--green); border-radius:50%; flex-shrink:0; box-shadow:0 0 6px var(--green); }
+.admin-email { font-size:12px; color:var(--text2); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.logout-btn {
+  display:flex; align-items:center; gap:7px;
+  font-size:12px; color:var(--muted); cursor:pointer;
+  padding:7px 12px; border-radius:var(--radius-sm);
+  transition:all .12s; border:none; background:none; width:100%;
+}
+.logout-btn:hover { color:#fb7185; background:rgba(244,63,94,.06); }
+
+/* ── MAIN ── */
+.main { margin-left:228px; padding:28px 32px; min-height:100vh; }
+.page { display:none; }
+.page.active { display:block; animation:fadeIn .18s ease; }
+@keyframes fadeIn { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:none} }
+
+.page-header {
+  display:flex; align-items:center; justify-content:space-between;
+  margin-bottom:24px; flex-wrap:wrap; gap:12px;
+}
+.page-title { font-size:22px; font-weight:700; letter-spacing:-.4px; }
+.page-title em { color:var(--accent2); font-style:normal; }
+
+/* ── STATS ── */
+.stats-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-bottom:24px; }
+.stat-card {
+  background:var(--surface); border:1px solid var(--border);
+  border-radius:var(--radius); padding:20px; position:relative; overflow:hidden;
+  transition:border-color .15s;
+}
+.stat-card:hover { border-color:var(--border2); }
+.stat-accent { position:absolute; top:0; left:0; right:0; height:2px; }
+.stat-accent.total { background:linear-gradient(90deg, #a78bfa, #7c3aed); }
+.stat-accent.active { background:linear-gradient(90deg, #10b981, #34d399); }
+.stat-accent.expired { background:linear-gradient(90deg, #f43f5e, #fb7185); }
+.stat-accent.vip { background:linear-gradient(90deg, #fbbf24, #fcd34d); }
+.stat-label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:1px; margin-bottom:10px; }
+.stat-value { font-family:var(--mono); font-size:28px; font-weight:700; line-height:1; }
+.stat-icon { position:absolute; right:18px; top:50%; transform:translateY(-50%); font-size:26px; opacity:.1; }
+
+/* ── TABLE ── */
+.table-card {
+  background:var(--surface); border:1px solid var(--border);
+  border-radius:var(--radius); overflow:hidden;
+}
+.table-header {
+  display:flex; align-items:center; justify-content:space-between;
+  padding:14px 20px; border-bottom:1px solid var(--border);
+  flex-wrap:wrap; gap:8px;
+}
+.table-title { font-size:14px; font-weight:600; }
+.search-wrap {
+  display:flex; align-items:center; gap:7px;
+  background:var(--bg); border:1px solid var(--border2);
+  border-radius:var(--radius-sm); padding:7px 12px;
+}
+.search-wrap span { color:var(--muted); font-size:13px; }
+.search-wrap input {
+  background:none; border:none; outline:none;
+  color:var(--text); font-family:var(--sans); font-size:13px; width:180px;
+}
+.search-wrap input::placeholder { color:var(--muted); }
+
+table { width:100%; border-collapse:collapse; }
+th {
+  text-align:left; padding:9px 16px; font-size:10px;
+  text-transform:uppercase; letter-spacing:1px; color:var(--muted);
+  background:rgba(255,255,255,.015); border-bottom:1px solid var(--border);
+  white-space:nowrap; font-weight:500;
+}
+td { padding:10px 16px; font-size:13px; border-bottom:1px solid rgba(28,28,53,.8); vertical-align:middle; }
+tr:last-child td { border-bottom:none; }
+tr:hover td { background:rgba(124,58,237,.03); }
+
+.key-cell {
+  font-family:var(--mono); font-size:11px; color:var(--accent2);
+  background:rgba(124,58,237,.08); padding:3px 8px;
+  border-radius:5px; border:1px solid rgba(124,58,237,.18);
+  display:inline-block; letter-spacing:.3px;
+}
+.key-cell.small { font-size:10px; }
+
+.badge {
+  display:inline-flex; align-items:center; gap:5px;
+  padding:3px 9px; border-radius:20px;
+  font-size:11px; font-weight:500;
+}
+.dot { width:6px; height:6px; border-radius:50%; }
+.badge-active { background:rgba(16,185,129,.1); color:#34d399; border:1px solid rgba(16,185,129,.2); }
+.badge-active .dot { background:#10b981; }
+.badge-expired { background:rgba(244,63,94,.1); color:#fb7185; border:1px solid rgba(244,63,94,.2); }
+.badge-expired .dot { background:#f43f5e; }
+.badge-vip { background:rgba(251,191,36,.1); color:#fcd34d; border:1px solid rgba(251,191,36,.2); }
+.type-label { font-size:11px; color:var(--muted); }
+
+.icon-btn {
+  background:none; border:1px solid var(--border); color:var(--muted);
+  padding:4px 9px; border-radius:6px; cursor:pointer; font-size:12px;
+  transition:all .12s; font-family:var(--mono);
+}
+.icon-btn:hover { border-color:var(--accent2); color:var(--accent2); }
+.del-btn:hover { border-color:rgba(244,63,94,.4)!important; color:#fb7185!important; }
+
+.mono { font-family:var(--mono); }
+.muted { color:var(--muted); }
+.small { font-size:12px; }
+
+/* ── TABS ── */
+.tabs {
+  display:flex; gap:3px; margin-bottom:18px;
+  background:var(--surface); border:1px solid var(--border);
+  border-radius:var(--radius-sm); padding:3px; width:fit-content;
+}
+.tab {
+  padding:6px 16px; border-radius:6px; cursor:pointer;
+  font-size:12px; font-weight:500; color:var(--muted); transition:all .12s;
+}
+.tab:hover { color:var(--text2); }
+.tab.active { background:linear-gradient(135deg, var(--accent), #7c3aed); color:white; }
+
+/* ── BULK BAR ── */
+.bulk-bar {
+  display:none; align-items:center; gap:10px;
+  background:rgba(124,58,237,.08); border:1px solid rgba(124,58,237,.2);
+  border-radius:var(--radius-sm); padding:9px 14px; margin-bottom:14px; font-size:13px;
+}
+.bulk-bar.show { display:flex; }
+.bulk-count { color:var(--accent2); font-weight:500; }
+
+/* ── MODAL ── */
+.modal-overlay {
+  display:none; position:fixed; inset:0;
+  background:rgba(0,0,0,.8); backdrop-filter:blur(6px);
+  z-index:1000; align-items:center; justify-content:center;
+}
+.modal-overlay.show { display:flex; }
+.modal {
+  background:var(--surface); border:1px solid var(--border2);
+  border-radius:16px; padding:28px; width:460px; max-width:92vw;
+  animation:modalIn .2s ease;
+  box-shadow:0 24px 64px rgba(0,0,0,.7);
+}
+@keyframes modalIn { from{opacity:0;transform:scale(.96)} to{opacity:1;transform:none} }
+.modal-title { font-size:16px; font-weight:700; margin-bottom:20px; display:flex; align-items:center; gap:8px; }
+.modal-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:24px; }
+
+/* ── SETTINGS ── */
+.settings-section {
+  background:var(--surface); border:1px solid var(--border);
+  border-radius:var(--radius); padding:22px; margin-bottom:14px;
+}
+.settings-title {
+  font-size:13px; font-weight:600; margin-bottom:16px;
+  padding-bottom:12px; border-bottom:1px solid var(--border);
+  display:flex; align-items:center; gap:7px;
+}
+
+/* ── GEN LIST ── */
+.gen-item {
+  display:flex; align-items:center; justify-content:space-between;
+  padding:7px 0; border-bottom:1px solid var(--border);
+}
+.gen-item:last-child { border-bottom:none; }
+
+/* ── LOG ── */
+.log-item {
+  display:flex; align-items:center; gap:12px;
+  padding:11px 20px; border-bottom:1px solid rgba(28,28,53,.6); font-size:13px;
+}
+.log-dot { width:7px; height:7px; border-radius:50%; flex-shrink:0; }
+.log-time { font-family:var(--mono); font-size:11px; color:var(--muted); margin-left:auto; white-space:nowrap; }
+
+/* ── EMPTY ── */
+.empty-state { text-align:center; padding:40px; color:var(--muted); font-size:13px; }
+.empty-icon { font-size:30px; margin-bottom:10px; opacity:.5; }
+.empty-cell { padding:0!important; }
+
+/* ── TOAST ── */
+.toast-container {
+  position:fixed; bottom:24px; right:24px; z-index:9999;
+  display:flex; flex-direction:column; gap:8px;
+}
+.toast {
+  background:var(--surface2); border:1px solid var(--border2);
+  border-radius:10px; padding:11px 16px; font-size:13px;
+  display:flex; align-items:center; gap:9px;
+  box-shadow:0 8px 24px rgba(0,0,0,.5);
+  animation:toastIn .2s ease; min-width:200px;
+  transition:opacity .2s, transform .2s;
+}
+@keyframes toastIn { from{opacity:0;transform:translateX(12px)} to{opacity:1;transform:none} }
+.toast-icon {
+  width:20px; height:20px; border-radius:50%;
+  display:flex; align-items:center; justify-content:center;
+  font-size:11px; font-weight:700; flex-shrink:0;
+}
+.toast-success { border-left:3px solid var(--green); }
+.toast-success .toast-icon { background:rgba(16,185,129,.15); color:var(--green); }
+.toast-error { border-left:3px solid var(--red); }
+.toast-error .toast-icon { background:rgba(244,63,94,.15); color:#fb7185; }
+.toast-info { border-left:3px solid var(--blue); }
+.toast-info .toast-icon { background:rgba(56,189,248,.15); color:var(--blue); }
+
+/* ── CODE BLOCK ── */
+.code-block {
+  background:var(--bg); border:1px solid var(--border);
+  border-radius:var(--radius-sm); padding:16px; font-size:11px;
+  color:var(--accent2); overflow-x:auto; line-height:1.8;
+  font-family:var(--mono);
+}
+
+::-webkit-scrollbar { width:4px; height:4px; }
+::-webkit-scrollbar-track { background:transparent; }
+::-webkit-scrollbar-thumb { background:var(--border2); border-radius:2px; }
+
+input[type="checkbox"] { accent-color:var(--accent); width:14px; height:14px; cursor:pointer; }
+
+@media (max-width:900px) {
+  .stats-grid { grid-template-columns:repeat(2,1fr); }
+  .sidebar { width:60px; }
+  .logo-sub,.logo-mark { display:none; }
+  .nav-label,.admin-email,.admin-badge,.logout-label { display:none; }
+  .main { margin-left:60px; padding:16px; }
+  .nav-item { justify-content:center; padding:12px; }
+}
+</style>
+</head>
+<body>
+
+<!-- LOGIN -->
+<div id="login-screen">
+  <div class="login-card">
+    <div class="login-header">
+      <div class="login-brand">RENX</div>
+      <div class="login-sub">Key Manager</div>
+      <div class="login-divider"></div>
+    </div>
+    <div id="login-error" class="login-error">Email hoặc mật khẩu không đúng.</div>
+    <div class="field">
+      <label class="field-label">Email</label>
+      <input class="field-input" id="login-email" type="email" placeholder="admin@example.com" autocomplete="email">
+    </div>
+    <div class="field">
+      <label class="field-label">Mật khẩu</label>
+      <input class="field-input" id="login-pass" type="password" placeholder="••••••••••" autocomplete="current-password">
+    </div>
+    <button class="btn btn-primary" id="login-btn" onclick="doLogin()">Đăng nhập</button>
+  </div>
+</div>
+
+<!-- APP -->
+<div id="app-screen">
+
+  <!-- SIDEBAR -->
+  <aside class="sidebar">
+    <div class="sidebar-top">
+      <div class="logo-mark">RENX</div>
+      <div class="logo-sub">Key Manager</div>
+    </div>
+    <nav>
+      <div class="nav-item active" onclick="navigate('dashboard')">
+        <span class="nav-icon">◈</span><span class="nav-label">Dashboard</span>
+      </div>
+      <div class="nav-item" onclick="navigate('keys')">
+        <span class="nav-icon">🔑</span><span class="nav-label">Quản lý Key</span>
+      </div>
+      <div class="nav-item" onclick="navigate('generate')">
+        <span class="nav-icon">⚡</span><span class="nav-label">Tạo Key</span>
+      </div>
+      <div class="nav-item" onclick="navigate('activity')">
+        <span class="nav-icon">📋</span><span class="nav-label">Lịch sử</span>
+      </div>
+      <div class="nav-item" onclick="navigate('settings')">
+        <span class="nav-icon">⚙</span><span class="nav-label">Cài đặt</span>
+      </div>
+    </nav>
+    <div class="sidebar-footer">
+      <div class="admin-badge">
+        <span class="admin-dot"></span>
+        <span class="admin-email" id="admin-email">—</span>
+      </div>
+      <button class="logout-btn" onclick="doLogout()">
+        🚪 <span class="logout-label">Đăng xuất</span>
+      </button>
+    </div>
+  </aside>
+
+  <!-- MAIN -->
+  <main class="main">
+
+    <!-- DASHBOARD -->
+    <div class="page active" id="page-dashboard">
+      <div class="page-header">
+        <div class="page-title">Dashboard <em>Overview</em></div>
+        <button class="btn btn-primary" style="width:auto" onclick="navigate('generate')">⚡ Tạo Key</button>
+      </div>
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-accent total"></div>
+          <div class="stat-label">Tổng Key</div>
+          <div class="stat-value" id="stat-total">0</div>
+          <div class="stat-icon">🔑</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-accent active"></div>
+          <div class="stat-label">Active</div>
+          <div class="stat-value" id="stat-active" style="color:var(--green)">0</div>
+          <div class="stat-icon">✅</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-accent expired"></div>
+          <div class="stat-label">Hết hạn</div>
+          <div class="stat-value" id="stat-expired" style="color:var(--red)">0</div>
+          <div class="stat-icon">❌</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-accent vip"></div>
+          <div class="stat-label">VIP</div>
+          <div class="stat-value" id="stat-vip" style="color:var(--yellow)">0</div>
+          <div class="stat-icon">👑</div>
+        </div>
+      </div>
+      <div class="table-card">
+        <div class="table-header">
+          <div class="table-title">Key Gần Đây</div>
+          <button class="btn btn-outline" style="font-size:12px;padding:6px 12px" onclick="navigate('keys')">Xem tất cả →</button>
+        </div>
+        <table>
+          <thead><tr><th>KEY</th><th>USER ID</th><th>LOẠI</th><th>HẾT HẠN</th><th>TRẠNG THÁI</th></tr></thead>
+          <tbody id="recent-table"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- KEYS -->
+    <div class="page" id="page-keys">
+      <div class="page-header">
+        <div class="page-title">Quản lý <em>Key</em></div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-outline" onclick="exportKeys()">📤 Xuất CSV</button>
+          <button class="btn btn-primary" style="width:auto" onclick="openAddModal()">+ Thêm Key</button>
+        </div>
+      </div>
+      <div class="tabs">
+        <div class="tab active" onclick="filterKeys('all',this)">Tất cả</div>
+        <div class="tab" onclick="filterKeys('active',this)">Active</div>
+        <div class="tab" onclick="filterKeys('expired',this)">Hết hạn</div>
+        <div class="tab" onclick="filterKeys('vip',this)">VIP</div>
+      </div>
+      <div class="bulk-bar" id="bulk-bar">
+        <span class="bulk-count" id="bulk-count">0 key được chọn</span>
+        <button class="btn btn-danger" style="font-size:12px;padding:5px 12px" onclick="bulkDelete()">🗑 Xóa</button>
+        <button class="btn btn-ghost" style="font-size:12px;padding:5px 10px" onclick="clearSelection()">✕ Bỏ chọn</button>
+      </div>
+      <div class="table-card">
+        <div class="table-header">
+          <div class="table-title">Danh sách Key</div>
+          <div class="search-wrap">
+            <span>🔍</span>
+            <input type="text" placeholder="Tìm key, userId..." id="search-input" oninput="renderKeyTable()">
+          </div>
+        </div>
+        <div style="overflow-x:auto">
+          <table>
+            <thead><tr>
+              <th><input type="checkbox" id="select-all" onchange="toggleSelectAll()"></th>
+              <th>KEY</th><th>USER ID</th><th>LOẠI</th><th>NGÀY TẠO</th><th>HẾT HẠN</th><th>TRẠNG THÁI</th><th>THAO TÁC</th>
+            </tr></thead>
+            <tbody id="keys-table"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- GENERATE -->
+    <div class="page" id="page-generate">
+      <div class="page-header"><div class="page-title">Tạo <em>Key Mới</em></div></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">
+        <div class="settings-section">
+          <div class="settings-title">⚡ Tạo Key Nhanh</div>
+          <div class="form-group">
+            <label class="form-label">Tên sau RENX_ <span style="color:var(--muted);font-weight:400">(bỏ trống = random)</span></label>
+            <div style="display:flex;align-items:center;gap:8px">
+              <span style="font-family:var(--mono);font-size:13px;color:var(--accent);white-space:nowrap">RENX_</span>
+              <input class="form-input" id="gen-suffix" placeholder="Tên hoặc số... (vd: ADMIN, 2026)" style="flex:1">
+            </div>
+            <div style="font-size:11px;color:var(--muted);margin-top:4px">Chỉ dùng chữ, số, dấu gạch dưới. Nếu nhập tên sẽ tạo đúng 1 key dù số lượng > 1.</div>
+          </div>
+          <div class="form-group"><label class="form-label">Loại Key</label>
+            <select class="form-select" id="gen-type">
+              <option value="normal">Normal (8 tiếng)</option>
+              <option value="day">Daily (1 ngày)</option>
+              <option value="week">Weekly (7 ngày)</option>
+              <option value="month" selected>Monthly (30 ngày)</option>
+              <option value="vip">VIP (Vĩnh viễn)</option>
+            </select>
+          </div>
+          <div class="form-group"><label class="form-label">Số lượng <span style="color:var(--muted);font-weight:400">(bỏ qua nếu có tên)</span></label><input class="form-input" id="gen-amount" type="number" value="1" min="1" max="100"></div>
+          <button class="btn btn-primary" onclick="generateKeys()">⚡ Tạo Key</button>
+        </div>
+        <div class="settings-section">
+          <div class="settings-title">📋 Key Vừa Tạo</div>
+          <div id="generated-list" style="min-height:120px;max-height:220px;overflow-y:auto">
+            <div class="empty-state"><div class="empty-icon">🔑</div><div>Chưa có key nào</div></div>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:14px">
+            <button class="btn btn-outline" style="flex:1;font-size:12px" onclick="copyAllGenerated()">⎘ Copy Tất Cả</button>
+            <button class="btn btn-ghost" style="flex:1;font-size:12px" onclick="clearGenerated()">🗑 Xóa List</button>
+          </div>
+        </div>
+      </div>
+      <div class="settings-section">
+        <div class="settings-title">📦 Tạo Hàng Loạt</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;align-items:end">
+          <div>
+            <div class="form-group">
+              <label class="form-label">Tên sau RENX_ <span style="color:var(--muted);font-weight:400">(bỏ trống = random)</span></label>
+              <div style="display:flex;align-items:center;gap:8px">
+                <span style="font-family:var(--mono);font-size:13px;color:var(--accent);white-space:nowrap">RENX_</span>
+                <input class="form-input" id="bulk-suffix" placeholder="Bỏ trống = random" style="flex:1">
+              </div>
+            </div>
+            <div class="form-group"><label class="form-label">Số lượng <span style="color:var(--muted);font-weight:400">(bỏ qua nếu có tên)</span></label><input class="form-input" id="bulk-amount" type="number" value="10" min="1" max="500"></div>
+          </div>
+          <div>
+            <div class="form-group"><label class="form-label">Loại Key</label>
+              <select class="form-select" id="bulk-type"><option value="normal">Normal</option><option value="week">Weekly</option><option value="month" selected>Monthly</option><option value="vip">VIP</option></select>
+            </div>
+            <button class="btn btn-primary" style="margin-top:8px" onclick="bulkGenerate()">📦 Tạo Hàng Loạt</button>
+          </div>
+          <div style="color:var(--muted);font-size:12px;line-height:1.9">Key tạo ra chưa gắn User ID. Khi người dùng nhập key lần đầu, hệ thống tự động gắn ID của họ vào key đó.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ACTIVITY -->
+    <div class="page" id="page-activity">
+      <div class="page-header">
+        <div class="page-title">Lịch sử <em>Hoạt động</em></div>
+        <button class="btn btn-danger" onclick="clearLogs()">🗑 Xóa Log</button>
+      </div>
+      <div class="table-card" id="activity-log" style="padding:0">
+        <div class="empty-state"><div class="empty-icon">📋</div><div>Đang tải...</div></div>
+      </div>
+    </div>
+
+    <!-- SETTINGS -->
+    <div class="page" id="page-settings">
+      <div class="page-header"><div class="page-title">Cài đặt <em>Hệ Thống</em></div></div>
+      <div class="settings-section">
+        <div class="settings-title">🎮 Code Roblox Script</div>
+        <div style="font-size:12px;color:var(--muted);margin-bottom:12px">Dán đoạn này vào LocalScript Roblox để check key qua Firebase:</div>
+        <pre class="code-block"><code id="roblox-code">local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+
+local DB = "https://renxkey-38ec3-default-rtdb.asia-southeast1.firebasedatabase.app"
+-- Thay bằng Web API Key của Firebase project của bạn
+local FIREBASE_API_KEY = "AIzaSyBnMlJe0q39CNZvttpNpLVnTlMXC6Z1ss8"
+
+CheckButton.MouseButton1Click:Connect(function()
+    local input = TextBox.Text:match("^%s*(.-)%s*$") -- trim whitespace
+    local userId = tostring(LocalPlayer.UserId)
+    local keyId = input:gsub("[^%w_]", "_")
+
+    -- 1. Đọc key từ Firebase
+    local url = DB .. "/keys/" .. keyId .. ".json"
+    local ok, res = pcall(function() return game:HttpGet(url) end)
+    if not ok then StatusLabel.Text = "❌ Lỗi kết nối!"; return end
+
+    local data = HttpService:JSONDecode(res)
+    if data == nil then
+        StatusLabel.Text = "❌ Key không tồn tại!"
+        return
+    end
+
+    -- 2. Kiểm tra key đã bị gắn cho người khác chưa
+    if data.userId ~= nil and data.userId ~= "" and data.userId ~= userId then
+        StatusLabel.Text = "❌ Key này đã thuộc về người khác!"
+        return
+    end
+
+    -- 3. Kiểm tra hết hạn (expireAt là Unix timestamp giây)
+    local expireTs = tonumber(data.expireAt) or 0
+    if data.type ~= "vip" and expireTs > 0 and os.time() > expireTs then
+        StatusLabel.Text = "❌ Key đã hết hạn!"
+        return
+    end
+
+    -- 4. Nếu key chưa có userId → tự động gắn userId của người dùng này
+    if data.userId == nil or data.userId == "" then
+        local patchUrl = DB .. "/keys/" .. keyId .. ".json?auth=" .. FIREBASE_API_KEY
+        local body = HttpService:JSONEncode({ userId = userId })
+        local pok, _ = pcall(function()
+            HttpService:RequestAsync({
+                Url = patchUrl,
+                Method = "PATCH",
+                Headers = { ["Content-Type"] = "application/json" },
+                Body = body
+            })
+        end)
+        if not pok then
+            StatusLabel.Text = "⚠️ Không thể gắn key, thử lại!"
+            return
+        end
+    end
+
+    -- 5. Xác thực thành công
+    StatusLabel.Text = "✅ Xác thực thành công!"
+    task.wait(1)
+    ScreenGui:Destroy()
+    keyOk = true
+end)</code></pre>
+        <button class="btn btn-outline" style="margin-top:12px;font-size:12px" onclick="copyText(document.getElementById('roblox-code').textContent)">⎘ Copy Code</button>
+      </div>
+      <div class="settings-section">
+        <div class="settings-title">🔥 Firebase Rules</div>
+        <div style="font-size:12px;color:var(--muted);margin-bottom:12px">Dán vào Firebase Rules để bảo mật:</div>
+        <pre class="code-block"><code>{
+  "rules": {
+    "keys": {
+      ".read": true,
+      ".write": false,
+      "$keyId": {
+        ".read": true,
+        "userId": {
+          ".write": "data.val() === '' || data.val() === null"
+        }
+      }
+    },
+    "logs": {
+      ".read": false,
+      ".write": false
+    }
+  }
+}</code></pre>
+      </div>
+      <div class="settings-section">
+        <div class="settings-title">🗄️ Dữ liệu</div>
+        <button class="btn btn-outline" onclick="exportKeys()">📤 Xuất CSV</button>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<!-- ADD MODAL -->
+<div class="modal-overlay" id="modal-add">
+  <div class="modal">
+    <div class="modal-title">🔑 Thêm Key Mới</div>
+    <div class="form-group"><label class="form-label">Key</label><input class="form-input" id="modal-key" placeholder="RENX_..."></div>
+    <div class="form-group"><label class="form-label">Loại</label>
+      <select class="form-select" id="modal-type" onchange="document.getElementById('modal-expire').value=getExpireDateStr(this.value)">
+        <option value="normal">Normal</option><option value="week">Weekly</option><option value="month" selected>Monthly</option><option value="vip">VIP</option>
+      </select>
+    </div>
+    <div class="form-group"><label class="form-label">Hết hạn</label><input class="form-input" type="date" id="modal-expire"></div>
+    <div class="modal-actions">
+      <button class="btn btn-outline" onclick="closeModal('modal-add')">Hủy</button>
+      <button class="btn btn-primary" style="width:auto" onclick="addKeyManual()">Thêm Key</button>
+    </div>
+  </div>
+</div>
+
+<!-- EDIT MODAL -->
+<div class="modal-overlay" id="modal-edit">
+  <div class="modal">
+    <div class="modal-title">✏️ Chỉnh Sửa Key</div>
+    <input type="hidden" id="edit-id">
+    <div class="form-group"><label class="form-label">Key</label><input class="form-input" id="edit-key" readonly style="opacity:.4;cursor:not-allowed"></div>
+    <div class="form-group"><label class="form-label">User ID</label><input class="form-input" id="edit-userid"></div>
+    <div class="form-group"><label class="form-label">Loại</label>
+      <select class="form-select" id="edit-type"><option value="normal">Normal</option><option value="week">Weekly</option><option value="month" selected>Monthly</option><option value="vip">VIP</option></select>
+    </div>
+    <div class="form-group"><label class="form-label">Hết hạn</label><input class="form-input" type="date" id="edit-expire"></div>
+    <div class="modal-actions">
+      <button class="btn btn-outline" onclick="closeModal('modal-edit')">Hủy</button>
+      <button class="btn btn-primary" style="width:auto" onclick="saveEdit()">Lưu thay đổi</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast-container" id="toast-container"></div>
+
+<script>
+function navigate(page) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  document.getElementById('page-' + page).classList.add('active');
+  const idx = ['dashboard','keys','generate','activity','settings'].indexOf(page);
+  document.querySelectorAll('.nav-item')[idx]?.classList.add('active');
+  if (page === 'activity') window.loadLogs?.();
+}
+
+function getExpireDate(type) {
+  const d = new Date();
+  if (type === 'normal') d.setHours(d.getHours() + 8);
+  else if (type === 'day') d.setDate(d.getDate() + 1);
+  else if (type === 'week') d.setDate(d.getDate() + 7);
+  else if (type === 'month') d.setDate(d.getDate() + 30);
+  else if (type === 'vip') d.setFullYear(d.getFullYear() + 100);
+  return Math.floor(d.getTime() / 1000);
+}
+
+// Modal expire hiển thị ngày đẹp (input type=date cần YYYY-MM-DD)
+function getExpireDateStr(type) {
+  const d = new Date();
+  if (type === 'normal') d.setHours(d.getHours() + 8);
+  else if (type === 'day') d.setDate(d.getDate() + 1);
+  else if (type === 'week') d.setDate(d.getDate() + 7);
+  else if (type === 'month') d.setDate(d.getDate() + 30);
+  else if (type === 'vip') d.setFullYear(d.getFullYear() + 100);
+  return d.toISOString().split('T')[0];
+}
+
+document.getElementById('modal-expire').value = getExpireDateStr('month');
+document.querySelectorAll('.modal-overlay').forEach(o =>
+  o.addEventListener('click', e => { if (e.target === o) o.classList.remove('show'); })
+);
+</script>
+</body>
+</html>
